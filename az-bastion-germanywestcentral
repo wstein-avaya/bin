@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+
+set -eu
+
+main() {
+	CheckTunnelAlreadyEstablished
+	OpenBastionTunnel
+}
+
+CheckTunnelAlreadyEstablished() {
+	if [ -f /var/run/bastion-germanywestcentral.pid ] && [ -n "$(netstat -tuln | grep 8222)" ]; then
+		echo "Bastion tunnel to GermanyWestCentral is already running"
+		exit 0
+	fi
+}
+
+OpenBastionTunnel() {
+	echo "Opening bastion tunnel to GermanyWestCentral..."
+
+	az network bastion tunnel --name hcs-bastion-service-germanywestcentral --resource-group rg-hcs-germanywestcentral-qa --target-resource-id "/subscriptions/1a8a30e4-894b-4f2c-9315-edb4fc5a31db/resourceGroups/rg-hcs-germanywestcentral-qa/providers/Microsoft.Compute/virtualMachines/hcs-mgmt-vm-germanywestcentral" --resource-port 22 --port 8222 &
+	echo $! > /tmp/bastion-germanywestcentral.pid
+}
+
+main "$@"
