@@ -8,7 +8,7 @@ main() {
 }
 
 CheckTunnelAlreadyEstablished() {
-	if [ -f /var/run/bastion-brazilsouth.pid ] && [ -n "$(netstat -tuln | grep 8222)" ]; then
+	if [ -f /var/run/bastion-brazilsouth.pid ] && netstat -tuln | grep -q 8222; then
 		echo "Bastion tunnel to BrazilSouth is already running"
 		exit 0
 	fi
