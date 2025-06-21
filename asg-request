@@ -1,0 +1,408 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'net/http'
+require 'uri'
+require 'openssl'
+require 'tempfile'
+
+class ASGRequest
+  VERSION = '1.1.0'
+
+  COLORS = {
+    reset: "\e[0m", purple: "\e[95m", cyan: "\e[96m", green: "\e[92m",
+    yellow: "\e[93m", pink: "\e[95m", orange: "\e[91m", comment: "\e[91m",
+    blue: "\e[94m", red: "\e[31m"
+  }.freeze
+
+  LOGIN_OPTIONS = %w[admin craft init manager root sroot tsc user].sort.freeze
+  LOGIN_DESCRIPTIONS = {
+    "admin" => "Administrator account",
+    "craft" => "Standard maintenance account",
+    "init" => "Initial setup account",
+    "manager" => "System manager account",
+    "root" => "Root account (highest privileges)",
+    "sroot" => "Service root account",
+    "tsc" => "Technical service account?",
+    "user" => "Standard user account"
+  }.freeze
+
+  PATTERNS = {
+    login: [
+      /\(([^@)]+)@[\d.]+\)/, /\(([^@)]+)@[^)]+\)/, /login[:\s=\-]+([^\s\)@]+)/i,
+      /user[:\s=\-]+([^\s\)@]+)/i, /([a-zA-Z_][a-zA-Z0-9_]*)@[\d.]+/
+    ],
+    challenge: [
+      /challenge[:\s]+([^\s]+)/i, /challenge\s*[=\-]\s*([^\s]+)/i,
+      /([0-9]{4,6}[-][0-9]{6,10})/, /challenge[^\d]*([0-9]{4,}[-]?[0-9]*)/i
+    ],
+    product_id: [
+      /id[:\s]+([a-f0-9]{20,})/i, /id\s*[=\-]\s*([a-f0-9]{20,})/i,
+      /([a-f0-9]{32,64})/, /([a-f0-9]{20,})/
+    ]
+  }.freeze
+
+  DEFAULT_URL = "https://c3ha.avaya.com/conninfo/soap/ConnectionInfoService/getEasgResponse"
+
+  attr_reader :options
+
+  def initialize(options = {})
+    @options = options
+    disable_colors if options[:no_color]
+  end
+
+  def run
+    if options[:test]
+      test_patterns
+      return
+    end
+
+    if options[:login_test]
+      puts "Testing login selection feature..."
+      login = prompt_for_login(true)
+      puts "\nSelected login: #{login || 'None'}"
+      return
+    end
+
+    # Get input from clipboard or stdin
+    use_clipboard = ARGV.empty? && $stdin.tty?
+    input_text = if !use_clipboard && !$stdin.tty?
+                   $stdin.read
+                 else
+                   use_clipboard ? clipboard_read : $stdin.read
+                 end
+
+    result = extract_and_print(input_text)
+
+    # Check what information is missing
+    missing = []
+    missing << "login" if result[:login_name].nil?
+    missing << "challenge" if result[:challenge].nil?
+    missing << "product_id" if result[:product_id].nil?
+
+    if missing.empty?
+      make_and_handle_request(result, use_clipboard)
+    else
+      puts colorize(:red, "Cannot make request - missing required information: #{missing.join(', ')}")
+      exit 1
+    end
+  end
+
+  private
+
+  def colorize(color, text)
+    "#{COLORS[color]}#{text}#{COLORS[:reset]}"
+  end
+
+  def puts_color(color, text)
+    puts colorize(color, text)
+  end
+
+  def disable_colors
+    COLORS.keys.each { |k| COLORS[k] = "" }
+  end
+
+  def extract_and_print(text)
+    puts_color(:cyan, "\nInput text:")
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}"
+    puts_color(:yellow, text)
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}\n\n"
+
+    info = extract_info(text)
+    info[:login_name] ||= prompt_for_login unless options[:no_prompt]
+
+    puts_color(:cyan, "Extracted Information:")
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}"
+    %w[login_name challenge product_id].each do |field|
+      value = info[field.to_sym] || "#{COLORS[:orange]}NOT FOUND#{COLORS[:reset]}"
+      printf "#{COLORS[:purple]}%-15s#{COLORS[:reset]} #{COLORS[:green]}%s#{COLORS[:reset]}\n",
+             "#{field.tr('_', ' ').split.map(&:capitalize).join(' ')}:", value
+    end
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}\n"
+
+    info
+  end
+
+  def extract_info(text)
+    return { login_name: nil, challenge: nil, product_id: nil } if text.nil? || text.strip.empty?
+
+    normalized = text.to_s.gsub(/\r\n|\r/, "\n").strip
+    {
+      login_name: extract_field(normalized, :login),
+      challenge: extract_field(normalized, :challenge),
+      product_id: extract_field(normalized, :product_id, :hex)
+    }
+  end
+
+  def extract_field(text, field_type, validation = nil)
+    PATTERNS[field_type].each do |pattern|
+      next unless (match = text.match(pattern)) && match[1]
+
+      captured = match[1].strip
+      next if captured.empty?
+      next if validation == :hex && (!captured.match?(/^[a-f0-9]+$/i) || captured.length < 20)
+
+      return captured
+    end
+    nil
+  end
+
+  def prompt_for_login(force_interactive = false)
+    puts_color(:blue, "No login found. Please select a login:")
+    puts_color(:yellow, "Tip: Type the initial letter to quickly select")
+
+    return select_with_fzf if use_fzf?(force_interactive)
+
+    # Fallback to simple selection if fzf is not available
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}"
+
+    # Display login options indexed from 1 to n (not by letter)
+    LOGIN_OPTIONS.each_with_index do |login, idx|
+      puts "#{COLORS[:cyan]}  #{idx + 1}. #{COLORS[:green]}#{login}#{COLORS[:reset]}"
+    end
+    puts "#{COLORS[:comment]}#{'-' * 30}#{COLORS[:reset]}"
+
+    print "#{COLORS[:cyan]}Enter selection (1-#{LOGIN_OPTIONS.size}), name, or initial letter: #{COLORS[:reset]}"
+    selection = $stdin.gets&.chomp&.downcase || ""
+
+    return handle_selection(selection, nil)
+  end
+
+  def handle_selection(selection, initial_letters)
+    # Number selection
+    if selection =~ /^\d+$/ && (1..LOGIN_OPTIONS.size).include?(selection.to_i)
+      login = LOGIN_OPTIONS[selection.to_i - 1]
+      puts_color(:green, "Selected login: #{login}")
+      return login
+    end
+
+    # Direct name match
+    if LOGIN_OPTIONS.include?(selection)
+      puts_color(:green, "Selected login: #{selection}")
+      return selection
+    end
+
+    # Initial letter match
+    if selection.length == 1
+      matches = LOGIN_OPTIONS.select { |opt| opt.start_with?(selection) }
+
+      case matches.size
+      when 1
+        puts_color(:green, "Selected login: #{matches[0]}")
+        return matches[0]
+      when 0
+        puts_color(:orange, "No matches for initial letter '#{selection}'")
+      else
+        return disambiguate_matches(matches)
+      end
+    end
+
+    # No valid selection
+    if selection.strip.empty?
+      puts_color(:orange, "No login selected. Proceeding without login.")
+    else
+      puts_color(:orange, "Invalid login. Proceeding without login.")
+    end
+
+    nil
+  end
+
+  def disambiguate_matches(matches)
+    puts_color(:yellow, "Multiple matches for this initial letter:")
+
+    matches.each_with_index do |match, idx|
+      puts "#{COLORS[:cyan]}  #{idx + 1}. #{COLORS[:green]}#{match}#{COLORS[:reset]}"
+    end
+
+    print "#{COLORS[:cyan]}Select number (1-#{matches.size}): #{COLORS[:reset]}"
+    sub_input = $stdin.gets&.chomp
+
+    if sub_input =~ /^\d+$/ && (1..matches.size).include?(sub_input.to_i)
+      selected = matches[sub_input.to_i - 1]
+      puts_color(:green, "Selected login: #{selected}")
+      return selected
+    end
+
+    puts_color(:orange, "Invalid selection. Proceeding without login.")
+    nil
+  end
+
+  def use_fzf?(force_interactive)
+    return false if options[:no_fzf] || !(force_interactive || $stdin.tty?)
+
+    fzf_found = system("which fzf > /dev/null 2>&1")
+    unless fzf_found
+      puts_color(:yellow, "Note: fzf not found. Using standard selection interface.")
+      puts_color(:blue, "To install fzf (for improved selection):")
+      puts "  #{COLORS[:green]}macOS:#{COLORS[:reset]} brew install fzf"
+      puts "  #{COLORS[:green]}Linux:#{COLORS[:reset]} apt-get install fzf / yum install fzf"
+      puts "  #{COLORS[:green]}Windows:#{COLORS[:reset]} scoop install fzf / choco install fzf"
+      puts
+    end
+
+    fzf_found
+  end
+
+  def select_with_fzf
+    temp_file = Tempfile.new('fzf_output')
+    temp_path = temp_file.path
+    temp_file.close
+
+    begin
+      # Format options with index and descriptions
+      options_with_desc = LOGIN_OPTIONS.each_with_index.map do |login, idx|
+        num = (idx + 1).to_s.rjust(2)
+        desc = LOGIN_DESCRIPTIONS[login] || ''
+        "#{num} - #{login.ljust(10)} #{desc}"
+      end
+
+      header = "Select login (ESC to cancel, ↑/↓ to navigate, type to filter)"
+      fzf_cmd = [
+        "echo \"#{options_with_desc.join("\n")}\" |",
+        "fzf --height 13 --reverse --prompt=\"Login > \"",
+        "--header=\"#{header}\" --color=border:#00ffff,header:yellow",
+        "--border=rounded --ansi --bind=ctrl-j:accept,tab:accept",
+        "--no-mouse > #{temp_path}"
+      ].join(" ")
+
+      return nil unless system(fzf_cmd)
+
+      # Parse selection from fzf output
+      selection = File.read(temp_path).strip
+
+      # Extract login name from formatted selection (e.g., " 1 - craft ...")
+      if match = selection.match(/^\s*\d+\s*-\s*([a-zA-Z0-9_]+)/)
+        login = match[1]
+        return login if LOGIN_OPTIONS.include?(login)
+      end
+
+      # Fallback: search for login in selection
+      LOGIN_OPTIONS.each do |login|
+        return login if selection.include?(login)
+      end
+
+      nil
+    ensure
+      File.unlink(temp_path) if File.exist?(temp_path)
+    end
+  end
+
+  def clipboard_read
+    IO.popen('pbpaste').read.chomp
+  end
+
+  def clipboard_write(text)
+    IO.popen('pbcopy', 'w') { |io| io.write text }
+  end
+
+  def make_and_handle_request(result, use_clipboard)
+    begin
+      base_url = options[:url] || DEFAULT_URL
+
+      response = make_request(
+        result[:product_id],
+        result[:login_name],
+        result[:challenge],
+        base_url
+      )
+
+      if response
+        if use_clipboard
+          clipboard_write(response)
+          puts_color(:green, "✓ Response copied to clipboard!")
+        end
+      else
+        puts_color(:red, "Failed to get a valid response.")
+        exit 1
+      end
+    rescue Interrupt
+      puts_color(:yellow, "\nOperation interrupted by user.")
+      exit 1
+    rescue => e
+      puts_color(:red, "Request failed: #{e.message}")
+      exit 1
+    end
+  end
+
+  def make_request(product_id, login_name, challenge, base_url)
+    url = "#{base_url}?arg0=maestro&arg1=#{product_id}&arg2=#{login_name}&arg3=#{challenge}&arg4=0"
+
+    uri = URI(url)
+    http = Net::HTTP.new(uri.host, uri.port).tap do |h|
+      if uri.scheme == 'https'
+        h.use_ssl = true
+        h.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      end
+    end
+
+    response = http.request(Net::HTTP::Get.new(uri))
+
+    if match = response.body.match(/<ns2:getEasgResponseResponse.*?<return>(\w*)<\/return>/)
+      extracted = match[1]
+      puts "\n#{COLORS[:cyan]}Extracted Response:\n#{COLORS[:comment]}#{'-' * 30}\n#{COLORS[:pink]}#{extracted}\n#{COLORS[:comment]}#{'-' * 30}\n#{COLORS[:reset]}"
+      extracted
+    else
+      puts "\nNo matching response pattern found"
+      nil
+    end
+  rescue => e
+    puts "\nRequest failed: #{e.message}"
+    nil
+  end
+
+  def test_patterns
+    test_cases = [
+      { name: "Original", text: "(craft@135.124.74.131) Challenge: 30065-04961557 Product ID: 63b8a92b00a342b7a6b6d848f527647501" },
+      { name: "No Parens", text: "craft@135.124.74.131 Challenge: 30065-04961557 Product ID: 63b8a92b00a342b7a6b6d848f527647501" },
+      { name: "Alt Format", text: "User=admin Challenge=12345-67890123 ProductID:abc123def456789012345678901234567890" },
+      { name: "Mixed Case", text: "(USER@10.0.0.1) CHALLENGE: 11111-22222222 PRODUCT id: deadbeefcafebabe1234567890abcdef12" },
+      { name: "Whitespace", text: "  ( testuser@192.168.1.1 )   Challenge :   55555-44444444      Product ID:    1a2b3c4d5e6f7890abcdef1234567890ab   " },
+      { name: "Partial", text: "Challenge: 99999-12345678" },
+      { name: "None", text: "Just some random text without any useful data" }
+    ]
+
+    puts "\nTesting Pattern Matching:\n#{'=' * 60}"
+    test_cases.each_with_index do |tc, i|
+      puts "\nTest #{i + 1}: #{tc[:name]}\n#{'-' * 40}"
+      result = extract_info(tc[:text])
+      printf "Login: %-20s Challenge: %-15s Product ID: %s\n",
+             result[:login_name] || "NOT FOUND",
+             result[:challenge] || "NOT FOUND",
+             result[:product_id] || "NOT FOUND"
+    end
+    puts "\n#{'=' * 60}"
+  end
+end
+
+# Main execution
+if __FILE__ == $0
+  options = {}
+
+  OptionParser.new do |opts|
+    opts.banner = <<~EOB
+      ASG Request Tool - Extracts information and makes requests for ASG responses
+
+      Usage: #{$0} [options]
+
+      Example:
+        #{$0}                  # Read from clipboard, extract info, make request
+        echo "..." | #{$0}     # Process piped input
+        #{$0} -l               # Test login selection
+        #{$0} -t               # Run pattern tests
+    EOB
+
+    opts.on("-h", "--help", "Show help") { puts opts; exit }
+    opts.on("-t", "--test", "Run tests") { options[:test] = true }
+    opts.on("-l", "--login-test", "Test login selection") { options[:login_test] = true }
+    opts.on("-u", "--url URL", "Custom URL") { |u| options[:url] = u }
+    opts.on("--no-fzf", "Don't use fzf for selection even if available") { options[:no_fzf] = true }
+    opts.on("--no-color", "Disable colored output") { options[:no_color] = true }
+    opts.on("--no-prompt", "Don't prompt for missing information") { options[:no_prompt] = true }
+    opts.on("-v", "--version", "Show version") {
+      puts "ASG Request Tool v#{ASGRequest::VERSION}"
+      exit
+    }
+  end.parse!
+
+  ASGRequest.new(options).run
+end
